@@ -2,9 +2,9 @@ package nowplaying
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
-	"strconv"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -28,33 +28,28 @@ func GetPlugin() (plugintypes.SetConfig, plugintypes.SetApp, plugintypes.UI) {
 	return p, p, p
 }
 
-type NowPlaying struct {
-	Recenttracks *struct {
-		Track []*Track `json:"track"`
-	} `json:"recenttracks"`
+type Lfm struct {
+	Recenttracks *Recenttracks `xml:"recenttracks"`
+}
+
+type Recenttracks struct {
+	Track []*Track `xml:"track"`
 }
 
 type Track struct {
-	Artist *struct {
-		Mbid string `json:"mbid"`
-		Text string `json:"#text"`
-	} `json:"artist"`
-	Streamable string `json:"streamable"`
-	Image      []*struct {
-		Size string `json:"size"`
-		Text string `json:"#text"`
-	} `json:"image"`
-	Mbid  string `json:"mbid"`
+	Nowplaying string `xml:"nowplaying,attr"`
+	Artist     *struct {
+		Text string `xml:",chardata"`
+	} `xml:"artist"`
+	Name  string `xml:"name"`
 	Album *struct {
-		Mbid string `json:"mbid"`
-		Text string `json:"#text"`
-	} `json:"album"`
-	Name string `json:"name"`
-	URL  string `json:"url"`
-	Date *struct {
-		Uts  string `json:"uts"`
-		Text string `json:"#text"`
-	} `json:"date"`
+		Text string `xml:",chardata"`
+	} `xml:"album"`
+	URL   string `xml:"url"`
+	Image []*struct {
+		Text string `xml:",chardata"`
+		Size string `xml:"size,attr"`
+	} `xml:"image"`
 }
 
 func (p *plugin) SetConfig(config map[string]any) {
@@ -78,7 +73,7 @@ func (p *plugin) SetApp(app plugintypes.App) {
 	p.app = app
 
 	// Start ticker to refresh now playing every 5 minutes
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(2 * time.Minute)
 	done := make(chan bool)
 	go func() {
 		for {
@@ -97,11 +92,18 @@ func (p *plugin) SetApp(app plugintypes.App) {
 }
 
 func (p *plugin) fetchNowPlaying() {
+	// Check config
 	if p == nil || p.apiKey == "" || p.user == "" {
 		fmt.Println("nowplaying plugin: Not configured")
 		return
 	}
+	// Remember previous playing
 	hadPrevious := p.nowPlaying != nil
+	previousUrl := ""
+	if hadPrevious {
+		previousUrl = p.nowPlaying.URL
+	}
+	// Create exit function that clears now playing and cache on errors
 	exit := func() {
 		p.nowPlaying = nil
 		if hadPrevious {
@@ -109,21 +111,27 @@ func (p *plugin) fetchNowPlaying() {
 		}
 	}
 	// Fetch current now playing
-	result := &NowPlaying{}
-	err := requests.URL("http://ws.audioscrobbler.com/2.0/").
-		Param("method", "user.getrecenttracks").
-		Param("limit", "1").
-		Param("format", "json").
-		Param("user", p.user).
-		Param("api_key", p.apiKey).
-		Client(p.app.GetHTTPClient()).
-		ToJSON(result).
-		Fetch(context.Background())
+	result := &Lfm{}
+	pr, pw := io.Pipe()
+	go func() {
+		_ = pw.CloseWithError(
+			requests.URL("http://ws.audioscrobbler.com/2.0/").
+				Param("method", "user.getrecenttracks").
+				Param("limit", "3").
+				Param("user", p.user).
+				Param("api_key", p.apiKey).
+				Client(p.app.GetHTTPClient()).
+				ToWriter(pw).
+				Fetch(context.Background()),
+		)
+	}()
+	err := xml.NewDecoder(pr).Decode(result)
+	_ = pr.CloseWithError(err)
 	if err != nil {
 		exit()
 		return
 	}
-	// Save, if played in the last 10 minutes
+	// Check result
 	recents := result.Recenttracks
 	if recents == nil {
 		exit()
@@ -136,18 +144,17 @@ func (p *plugin) fetchNowPlaying() {
 	}
 	p.nowPlaying = nil
 	for _, track := range tracks {
-		if track.Date == nil || track.Date.Uts == "" {
+		if track.Nowplaying != "true" {
 			continue
 		}
-		unixTimestamp, _ := strconv.ParseInt(track.Date.Uts, 10, 64)
-		timestamp := time.Unix(int64(unixTimestamp), 0)
-		if time.Since(timestamp) < 10*time.Minute {
+		if track.URL != previousUrl {
 			p.nowPlaying = track
+			p.app.PurgeCache()
 		}
-		break
+		return
 	}
 	// Clear GoBlog cache
-	if hadPrevious || p.nowPlaying != nil {
+	if hadPrevious {
 		p.app.PurgeCache()
 	}
 }
