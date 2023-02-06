@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"time"
+	"strconv"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/carlmjohnson/requests"
@@ -50,6 +51,9 @@ type Track struct {
 		Text string `xml:",chardata"`
 		Size string `xml:"size,attr"`
 	} `xml:"image"`
+	Date *struct {
+		Uts string `xml:"uts,attr"`
+	} `xml:"date"`
 }
 
 func (p *plugin) SetConfig(config map[string]any) {
@@ -145,7 +149,14 @@ func (p *plugin) fetchNowPlaying() {
 	p.nowPlaying = nil
 	for _, track := range tracks {
 		if track.Nowplaying != "true" {
-			continue
+			unixTimestamp, _ := strconv.ParseInt(track.Date.Uts, 10, 64)
+			timestamp := time.Unix(int64(unixTimestamp), 0)
+		if time.Since(timestamp) < 10*time.Minute {
+				p.nowPlaying = track
+				break
+			} else {
+				continue
+			}
 		}
 		if track.URL != previousUrl {
 			p.nowPlaying = track
